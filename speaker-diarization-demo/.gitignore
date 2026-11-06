@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.egg
+.env
+
+# Local model / HF cache (Whisper, ECAPA ONNX, etc.)
+pretrained_models/
+.cache/
+
+# Node
+node_modules/
+dist/
+
+# Vite
+frontend/dist/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user

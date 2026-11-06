@@ -1,0 +1,26 @@
+{
+  "name": "speaker-diarization-backend",
+  "version": "1.0.0",
+  "description": "Node.js WebSocket gateway for real-time speaker diarization demo",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "node ./node_modules/typescript/lib/tsc.js",
+    "start": "node dist/server.js",
+    "dev": "node ./node_modules/ts-node/dist/bin.js src/server.ts",
+    "typecheck": "node ./node_modules/typescript/lib/tsc.js --noEmit"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "ws": "^8.18.2",
+    "dotenv": "^16.4.7",
+    "uuid": "^11.1.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/ws": "^8.5.14",
+    "@types/uuid": "^10.0.0",
+    "@types/node": "^22.15.34",
+    "typescript": "^5.8.3",
+    "ts-node": "^10.9.2"
+  }
+}

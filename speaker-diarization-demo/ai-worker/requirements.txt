@@ -1,0 +1,17 @@
+# Core
+websockets==13.1
+numpy==2.2.6
+scipy==1.15.3
+python-dotenv==1.0.1
+
+# Speaker embedding (ECAPA-TDNN ONNX)
+onnxruntime==1.20.1
+
+# Speech recognition
+faster-whisper==1.1.1
+
+# HF Hub — downloads the default ECAPA ONNX on first diarization load
+huggingface-hub==0.24.7
+
+# Audio utilities
+librosa==0.10.2
