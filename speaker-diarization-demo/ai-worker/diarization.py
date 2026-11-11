@@ -114,6 +114,16 @@ try:
 except ValueError:
     LONE_SPEAKER_WEAK_MERGE_MIN = 0.30
 
+# Consecutive weak-band embeddings required before a new speaker is created.
+# Per-segment ECAPA embeddings are noisy — a single borderline score (e.g.
+# 0.28 for the same voice) used to split one speaker into speaker_001 and
+# speaker_002. With N>1 the weak evidence must repeat before minting an
+# identity; until then the segment stays on the best existing speaker.
+# Set to 1 to restore the old create-on-first-weak-match behaviour.
+NEW_SPEAKER_CONFIRM_COUNT: int = max(
+    1, int(os.getenv("NEW_SPEAKER_CONFIRM_COUNT", "2"))
+)
+
 # Log cosine scores vs every enrolled speaker at INFO (for tuning thresholds).
 _raw_diar_scores = os.getenv("LOG_DIAR_SCORES", "false").strip().lower()
 LOG_DIAR_SCORES: bool = _raw_diar_scores in ("1", "true", "yes", "on")
@@ -374,6 +384,8 @@ class DiarizationSession:
         self._speakers: Dict[str, Speaker] = {}
         self._speaker_counter: int = 0
         self.last_speaker_id: Optional[str] = None
+        # Weak-band embeddings awaiting new-speaker confirmation.
+        self._pending_new: List[np.ndarray] = []
 
     @property
     def speakers(self) -> List[Speaker]:
@@ -529,6 +541,7 @@ class DiarizationSession:
             logger.info("Speaker match: no registered speakers → NEW SPEAKER (first)")
 
         if matched and best_id is not None:
+            self._pending_new.clear()
             spk = self._speakers[best_id]
             # Slow EMA update — keeps identity stable while adapting to drift.
             alpha = EMBEDDING_SMOOTHING_ALPHA
@@ -557,13 +570,50 @@ class DiarizationSession:
             )
             return spk, False, best_score
 
-        # New speaker.
+        # Weak-band evidence (score >= floor but below threshold, or a lost
+        # margin between two centroids): a single noisy embedding must not
+        # mint a new identity. Hold the segment on the best existing speaker
+        # until NEW_SPEAKER_CONFIRM_COUNT consecutive weak embeddings agree.
+        # Scores below the floor mean a genuinely different voice — those
+        # still create a new speaker immediately.
+        pending_pool: List[np.ndarray] = []
+        if (
+            allow_new_speaker
+            and best_id is not None
+            and best_score >= SPEAKER_CONTINUITY_FLOOR
+        ):
+            self._pending_new.append(embedding.copy())
+            if len(self._pending_new) < NEW_SPEAKER_CONFIRM_COUNT:
+                spk = self._speakers[best_id]
+                spk.sample_count += 1
+                logger.info(
+                    "Weak-band match held on %s (score=%.3f, pending=%d/%d)",
+                    spk.speaker_id,
+                    best_score,
+                    len(self._pending_new),
+                    NEW_SPEAKER_CONFIRM_COUNT,
+                )
+                return spk, False, best_score
+            pending_pool = self._pending_new
+
+        self._pending_new.clear()
+
+        # New speaker. When confirmation embeddings were collected, seed the
+        # centroid with their mean — more stable than the single last clip.
+        new_embedding = embedding
+        if pending_pool:
+            stacked = np.stack(pending_pool)
+            avg = stacked.mean(axis=0)
+            norm = np.linalg.norm(avg)
+            if norm > 1e-9:
+                new_embedding = avg / norm
+
         self._speaker_counter += 1
         spk_id = f"speaker_{self._speaker_counter:03d}"
         new_spk = Speaker(
             speaker_id=spk_id,
             display_name=f"Speaker {self._speaker_counter}",
-            embedding=embedding.copy(),
+            embedding=new_embedding,
             sample_count=1,
         )
         self._speakers[spk_id] = new_spk
