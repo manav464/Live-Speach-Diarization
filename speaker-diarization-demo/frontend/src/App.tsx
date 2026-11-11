@@ -104,7 +104,8 @@ const TARGET_SAMPLE_RATE = 16000;
 // ScriptProcessor buffer size — 4096 samples ≈ 256 ms at 16 kHz.
 const SCRIPT_PROCESSOR_BUFFER = 4096;
 // How many native-rate samples to accumulate before resampling + sending.
-const SEND_EVERY_SAMPLES = 8192; // roughly 170–340 ms depending on native rate
+// Lower = faster uplink (≈46 ms @ 44.1 kHz for 2048); no intentional playback delay.
+const SEND_EVERY_SAMPLES = 2048;
 
 const WS_RECONNECT_DELAY_MS = 3000;
 
@@ -721,9 +722,12 @@ export default function App(): React.ReactElement {
                     workerDiarReady,
                     !workerDiarReady && !workerDiarError
                   )}
-                  Diarization (ECAPA ONNX)
-                  {workerDiarError && (
-                    <span className="error-hint"> — unavailable</span>
+                  Diarization (Nemotron-3)
+                  {!workerDiarReady && workerDiarError && (
+                    <span className="error-hint"> — {workerDiarError}</span>
+                  )}
+                  {!workerDiarReady && !workerDiarError && (
+                    <span className="error-hint"> — not ready</span>
                   )}
                 </li>
                 <li>

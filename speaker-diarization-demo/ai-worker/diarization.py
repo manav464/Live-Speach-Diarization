@@ -1,28 +1,21 @@
 """
-diarization.py — CPU speaker diarization using an ECAPA-TDNN ONNX model.
+diarization.py — Speaker diarization with nvidia/Nemotron-3-Diarization.
 
-The embedding step uses ONNX Runtime only (no PyTorch / SpeechBrain). The
-default model is a community ONNX export of SpeechBrain's ECAPA-TDNN
-(same 192-dim voiceprint idea as before).
+Uses Hugging Face Transformers (streaming Sortformer + speaker cache) with
+automatic GPU preference when CUDA is available, otherwise CPU.
 
-Key design decisions
---------------------
-- We extract ONE embedding per processing window (the whole window), not per
-  VAD sub-segment.  VAD sub-segments inside a 3 s window are often only
-  0.5–1 s long, which produces unreliable embeddings.  The full 3 s window
-  always contains enough context.
-- We gate on the window-level RMS: if the whole window is too quiet we skip it.
-- We use a cosine-similarity threshold to decide same-speaker vs new-speaker.
-- Embeddings are updated with a slow EMA so the identity stays stable.
+NeMo SortformerEncLabelModel is attempted only when DIAR_BACKEND=nemo and a
+compatible NeMo build is installed; otherwise Transformers is used.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -34,99 +27,30 @@ logger = logging.getLogger(__name__)
 
 SAMPLE_RATE: int = int(os.getenv("SAMPLE_RATE", "16000"))
 
-# Hugging Face repo / file for the default ECAPA ONNX (Apache-2.0; see model card).
-ECAPA_ONNX_REPO_ID: str = os.getenv(
-    "ECAPA_ONNX_REPO_ID",
-    "kenrunio/transcriber-speaker-onnx",
-).strip()
-ECAPA_ONNX_FILENAME: str = os.getenv(
-    "ECAPA_ONNX_FILENAME",
-    "ecapa-any-length.onnx",
+NEMOTRON_MODEL_ID: str = os.getenv(
+    "NEMOTRON_MODEL_ID", "nvidia/Nemotron-3-Diarization"
 ).strip()
 
-# Optional explicit path to an .onnx file (skips Hub download when set).
-_raw_onnx_path = os.getenv("ECAPA_ONNX_PATH", "").strip()
-ECAPA_ONNX_PATH: Optional[Path] = (
-    Path(_raw_onnx_path).expanduser() if _raw_onnx_path else None
-)
+DIAR_BACKEND: str = os.getenv("DIAR_BACKEND", "transformers").strip().lower()
+DIAR_DEVICE: str = os.getenv("DIAR_DEVICE", "auto").strip().lower()
+DIAR_PRECISION: str = os.getenv("DIAR_PRECISION", "auto").strip().lower()
+DIAR_STREAMING_MODE: str = os.getenv(
+    "DIAR_STREAMING_MODE", "ultra_low_latency"
+).strip()
 
-# Cache directory for hf_hub_download (repo snapshots).
-ECAPA_ONNX_CACHE_DIR: Path = Path(
+DIAR_CACHE_DIR: Path = Path(
     os.getenv(
-        "ECAPA_ONNX_CACHE_DIR",
-        str(Path(__file__).resolve().parent / "pretrained_models" / "ecapa_onnx"),
+        "DIAR_CACHE_DIR",
+        str(Path(__file__).resolve().parent / "pretrained_models" / "nemotron_diar"),
     )
 ).expanduser()
 
-# Optional: cap clip length in samples (0 = use full clip). Some graphs are dynamic;
-# fixed-shape graphs may require padding/truncation to their expected length.
-ECAPA_ONNX_MAX_SAMPLES: int = int(os.getenv("ECAPA_ONNX_MAX_SAMPLES", "0"))
-
-# Lower thresholds make it easier to match the same speaker across changes
-# in volume, delivery, and short/partial windows. Increase if distinct
-# speakers are being merged.
-SPEAKER_SIMILARITY_THRESHOLD: float = float(
-    os.getenv("SPEAKER_SIMILARITY_THRESHOLD", "0.45")
-)
-
-SPEAKER_CONTINUITY_FLOOR: float = float(
-    os.getenv("SPEAKER_CONTINUITY_FLOOR", "0.32")
-)
-
-# Minimum window RMS to attempt embedding (avoids junk from silence windows).
-MIN_WINDOW_RMS: float = float(os.getenv("MIN_WINDOW_RMS", "0.015"))
-
-# Minimum speech inside a segment/window to attempt embedding.
-# Short utterances still produce usable ECAPA embeddings down to ~0.3 s;
-# below that we fall back to the continuity heuristic in main.py.
-MIN_EMBED_SPEECH_S: float = float(os.getenv("MIN_EMBED_SPEECH_S", "0.3"))
-
-# Minimum score gap between the best and second-best speaker before a
-# weak (below-threshold) match is accepted.  Prevents borderline scores
-# from being assigned to the wrong identity when two speakers are close.
-SPEAKER_MATCH_MARGIN: float = float(os.getenv("SPEAKER_MATCH_MARGIN", "0.08"))
-
-# EMA alpha for updating a speaker's stored embedding.
-# 0.1 = slow drift (stable identity), 0.3 = faster adaptation.
-EMBEDDING_SMOOTHING_ALPHA: float = float(os.getenv("EMBEDDING_SMOOTHING_ALPHA", "0.15"))
-
-# Optional: force every line to one label (disables ECAPA; main.py can short-circuit).
 _raw_single_mode = os.getenv("SINGLE_SPEAKER_MODE", "false").strip().lower()
 SINGLE_SPEAKER_MODE: bool = _raw_single_mode in ("1", "true", "yes", "on")
 SOLE_SPEAKER_ID: str = os.getenv("SOLE_SPEAKER_ID", "speaker_001").strip() or "speaker_001"
-SOLE_SPEAKER_DISPLAY: str = os.getenv("SOLE_SPEAKER_DISPLAY", "Speaker 1").strip() or "Speaker 1"
-
-# When only one speaker is registered, the legacy behaviour allowed "weak"
-# matches (score between floor and threshold) if score >= 75% of the strong
-# threshold — a second person's voice could still look similar enough to merge
-# into speaker_001. Set to true to use that 75%-of-threshold rule; keep false
-# and use LONE_SPEAKER_WEAK_MERGE_MIN for the weak band (recommended).
-_raw_relax = os.getenv("WEAK_MATCH_LONE_SPEAKER_RELAXATION", "false").strip().lower()
-WEAK_MATCH_LONE_SPEAKER_RELAXATION: bool = _raw_relax in ("1", "true", "yes", "on")
-
-# Lone speaker only (weak band): merge if best_score is in [min, threshold).
-# Below min, a second person can become speaker_002 (if the segment is long enough).
-_lone_weak_raw = os.getenv("LONE_SPEAKER_WEAK_MERGE_MIN", "0.30").strip()
-try:
-    LONE_SPEAKER_WEAK_MERGE_MIN: float = (
-        float(_lone_weak_raw) if _lone_weak_raw else 0.30
-    )
-except ValueError:
-    LONE_SPEAKER_WEAK_MERGE_MIN = 0.30
-
-# Consecutive weak-band embeddings required before a new speaker is created.
-# Per-segment ECAPA embeddings are noisy — a single borderline score (e.g.
-# 0.28 for the same voice) used to split one speaker into speaker_001 and
-# speaker_002. With N>1 the weak evidence must repeat before minting an
-# identity; until then the segment stays on the best existing speaker.
-# Set to 1 to restore the old create-on-first-weak-match behaviour.
-NEW_SPEAKER_CONFIRM_COUNT: int = max(
-    1, int(os.getenv("NEW_SPEAKER_CONFIRM_COUNT", "2"))
+SOLE_SPEAKER_DISPLAY: str = (
+    os.getenv("SOLE_SPEAKER_DISPLAY", "Speaker 1").strip() or "Speaker 1"
 )
-
-# Log cosine scores vs every enrolled speaker at INFO (for tuning thresholds).
-_raw_diar_scores = os.getenv("LOG_DIAR_SCORES", "false").strip().lower()
-LOG_DIAR_SCORES: bool = _raw_diar_scores in ("1", "true", "yes", "on")
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -146,129 +70,193 @@ class Speaker:
     display_name: str
     embedding: Optional[np.ndarray] = field(default=None, repr=False)
     sample_count: int = 0
+    nemotron_channel: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
-# ONNX Runtime session
+# Global model state
 # ---------------------------------------------------------------------------
 
-_ort_session = None  # type: ignore[assignment]
+_model_lock = threading.Lock()
+_backend: Optional[str] = None  # "transformers" | "nemo"
 _model_error: Optional[str] = None
 _model_available: bool = False
-_onnx_input_binding: Optional[Tuple[str, ...]] = None
-_onnx_path_loaded: Optional[Path] = None
+_device_label: str = "cpu"
+_dtype_label: str = "float32"
+
+# Transformers backend
+_t_processor = None
+_t_model = None
+_t_device = None
+_t_dtype = None
+
+# NeMo backend (optional)
+_nemo_model = None
+
+# ---------------------------------------------------------------------------
+# Device / dtype
+# ---------------------------------------------------------------------------
 
 
-def _ensure_onnx_model_path() -> Path:
-    """Return path to the ECAPA .onnx file, downloading from the Hub if needed."""
-    if ECAPA_ONNX_PATH is not None:
-        p = ECAPA_ONNX_PATH.resolve()
-        if not p.is_file():
-            raise FileNotFoundError(f"ECAPA_ONNX_PATH does not exist: {p}")
-        return p
+def _resolve_torch_device():
+    import torch
 
-    from huggingface_hub import hf_hub_download  # type: ignore
+    pref = DIAR_DEVICE
+    if pref == "cpu":
+        return torch.device("cpu")
+    if pref in ("cuda", "gpu"):
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        logger.warning("DIAR_DEVICE=%s but CUDA is unavailable — using CPU", pref)
+        return torch.device("cpu")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
 
-    ECAPA_ONNX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    return Path(
-        hf_hub_download(
-            repo_id=ECAPA_ONNX_REPO_ID,
-            filename=ECAPA_ONNX_FILENAME,
-            cache_dir=str(ECAPA_ONNX_CACHE_DIR),
-            local_files_only=False,
-        )
+
+def _resolve_dtype(device):
+    import torch
+
+    pref = DIAR_PRECISION
+    if pref == "fp32":
+        return torch.float32
+    if pref == "fp16":
+        return torch.float16
+    if pref == "bf16":
+        return torch.bfloat16
+    if device.type == "cuda":
+        if torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        return torch.float16
+    return torch.float32
+
+
+def _apply_nemo_streaming_preset(model) -> None:
+    mode = DIAR_STREAMING_MODE.strip().lower()
+    presets = {
+        "offline": (264, 40, 340, 40, 300),
+        "low_latency": (264, 264, 9, 4, 222),
+        "very_low_latency": (264, 264, 6, 2, 222),
+        "ultra_low_latency": (264, 264, 3, 1, 222),
+    }
+    spk, fifo, chunk, right, update = presets.get(mode, presets["low_latency"])
+    model.sortformer_modules.spkcache_len = spk
+    model.sortformer_modules.fifo_len = fifo
+    model.sortformer_modules.chunk_len = chunk
+    model.sortformer_modules.chunk_right_context = right
+    model.sortformer_modules.spkcache_update_period = update
+    model._check_streaming_parameters()
+    logger.info("NeMo streaming preset: %s", mode)
+
+
+def _load_transformers() -> bool:
+    global _t_processor, _t_model, _t_device, _t_dtype
+    global _backend, _model_available, _model_error, _device_label, _dtype_label
+
+    import torch
+    from transformers import AutoModelForAudioFrameClassification, AutoProcessor
+
+    _t_device = _resolve_torch_device()
+    _t_dtype = _resolve_dtype(_t_device)
+    _device_label = str(_t_device)
+    _dtype_label = str(_t_dtype).split(".")[-1]
+
+    cache = str(DIAR_CACHE_DIR)
+    DIAR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    logger.info(
+        "Loading Nemotron diarization (Transformers) on %s (%s)…",
+        _t_device,
+        _t_dtype,
     )
+    _t_processor = AutoProcessor.from_pretrained(NEMOTRON_MODEL_ID, cache_dir=cache)
+    _t_processor.set_streaming_mode(DIAR_STREAMING_MODE)
+    _t_model = AutoModelForAudioFrameClassification.from_pretrained(
+        NEMOTRON_MODEL_ID,
+        dtype=_t_dtype,
+        cache_dir=cache,
+    )
+    _t_model = _t_model.to(_t_device)
+    _t_model.eval()
+
+    _backend = "transformers"
+    _model_available = True
+    _model_error = None
+    logger.info(
+        "Nemotron-3-Diarization ready (transformers, streaming=%s, latency≈%sms)",
+        DIAR_STREAMING_MODE,
+        getattr(_t_processor, "streaming_latency_ms", "?"),
+    )
+    return True
 
 
-def _classify_onnx_io(session: object) -> dict:
-    """
-    Map ONNX graph inputs to our names. Supports common ECAPA exports:
-    - kenrunio/transcriber-speaker-onnx: wav + lens -> emb
-    - Pawls2theWall/equivl-ecapa-voxceleb-onnx: waveform -> embedding
-    """
-    in_meta = {x.name: x for x in session.get_inputs()}
-    wav_key = None
-    lens_key = None
-    for name in in_meta:
-        lower = name.lower()
-        if "lens" in lower or "length" in lower:
-            lens_key = name
-        elif any(
-            k in lower for k in ("wav", "waveform", "audio", "signal", "pcm")
-        ):
-            wav_key = name
-    if wav_key is None and in_meta:
-        # Single-input graphs: assume audio
-        if len(in_meta) == 1:
-            wav_key = next(iter(in_meta))
-        else:
-            raise ValueError(
-                "Cannot infer audio input name from ONNX model; inputs="
-                + repr(list(in_meta))
-            )
+def _load_nemo() -> bool:
+    global _nemo_model, _backend, _model_available, _model_error, _device_label
 
-    out_meta = session.get_outputs()
-    if not out_meta:
-        raise ValueError("ONNX model has no outputs")
+    import torch
+    from nemo.collections.asr.models import SortformerEncLabelModel
 
-    emb_out = out_meta[0].name
-    for o in out_meta:
-        lo = o.name.lower()
-        if "emb" in lo or "embedding" in lo or "output" in lo:
-            emb_out = o.name
-            break
+    device = _resolve_torch_device()
+    _device_label = str(device)
+    map_location = "cuda" if device.type == "cuda" else "cpu"
 
-    opts: dict = {"wav": wav_key, "emb_out": emb_out}
-    if lens_key is not None:
-        opts["lens"] = lens_key
-    return opts
+    logger.info("Loading Nemotron diarization (NeMo) on %s…", map_location)
+    _nemo_model = SortformerEncLabelModel.from_pretrained(
+        NEMOTRON_MODEL_ID,
+        map_location=map_location,
+    )
+    _nemo_model.eval()
+    if device.type == "cuda":
+        _nemo_model = _nemo_model.cuda()
+    else:
+        _nemo_model = _nemo_model.cpu()
+    _apply_nemo_streaming_preset(_nemo_model)
+
+    _backend = "nemo"
+    _model_available = True
+    _model_error = None
+    logger.info("Nemotron-3-Diarization ready (NeMo, streaming=%s)", DIAR_STREAMING_MODE)
+    return True
 
 
 def load_model() -> bool:
-    global _ort_session, _model_error, _model_available, _onnx_input_binding, _onnx_path_loaded
+    global _model_error, _model_available, _dtype_label
+
     if SINGLE_SPEAKER_MODE:
         _model_available = False
-        _ort_session = None
-        _onnx_input_binding = None
-        _onnx_path_loaded = None
+        _model_error = None
         logger.info(
-            "SINGLE_SPEAKER_MODE: ECAPA ONNX skipped; all speech labeled %s",
+            "SINGLE_SPEAKER_MODE: Nemotron diarization skipped; label=%s",
             SOLE_SPEAKER_ID,
         )
         return True
-    try:
-        import onnxruntime as ort  # type: ignore
 
-        onnx_path = _ensure_onnx_model_path()
-        logger.info("Loading ECAPA speaker embedding ONNX (%s)…", onnx_path)
+    with _model_lock:
+        if _model_available:
+            return True
 
-        so = ort.SessionOptions()
-        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        _ort_session = ort.InferenceSession(
-            str(onnx_path),
-            sess_options=so,
-            providers=["CPUExecutionProvider"],
-        )
-        opts = _classify_onnx_io(_ort_session)
-        _onnx_input_binding = (
-            opts.get("wav"),
-            opts.get("lens"),
-            opts.get("emb_out"),
-        )
-        _onnx_path_loaded = onnx_path
-        _model_available = True
-        ins = [x.name for x in _ort_session.get_inputs()]
-        outs = [x.name for x in _ort_session.get_outputs()]
-        logger.info(
-            "ECAPA ONNX loaded. inputs=%s outputs=%s",
-            ins,
-            outs,
-        )
-        return True
-    except Exception as exc:
-        _model_error = str(exc)
+        backends: List[str]
+        if DIAR_BACKEND == "nemo":
+            backends = ["nemo", "transformers"]
+        elif DIAR_BACKEND == "transformers":
+            backends = ["transformers"]
+        else:
+            backends = ["nemo", "transformers"]
+
+        errors: List[str] = []
+        for name in backends:
+            try:
+                if name == "nemo" and _load_nemo():
+                    return True
+                if name == "transformers" and _load_transformers():
+                    return True
+            except Exception as exc:
+                msg = f"{name}: {exc}"
+                errors.append(msg)
+                logger.warning("Diarization backend failed — %s", msg)
+
+        _model_error = "; ".join(errors) if errors else "No backend available"
         _model_available = False
-        logger.warning("ECAPA ONNX unavailable: %s", exc)
         return False
 
 
@@ -280,101 +268,76 @@ def get_model_error() -> Optional[str]:
     return _model_error
 
 
-def _run_onnx_embedding(waveform_1d: np.ndarray) -> Optional[np.ndarray]:
-    """Run ONNX ECAPA on float32 mono waveform, return 1D embedding or None."""
-    if _ort_session is None or _onnx_input_binding is None:
-        return None
-
-    wav_key, lens_key, emb_out_name = _onnx_input_binding
-    if wav_key is None:
-        return None
-
-    x = np.ascontiguousarray(waveform_1d, dtype=np.float32)
-    if ECAPA_ONNX_MAX_SAMPLES > 0 and x.shape[0] > ECAPA_ONNX_MAX_SAMPLES:
-        x = x[: ECAPA_ONNX_MAX_SAMPLES]
-
-    batch = x.reshape(1, -1)
-    feed: dict = {wav_key: batch}
-    if lens_key is not None:
-        # Fraction of each row that is real audio (1.0 = no padding), per kenrunio card.
-        feed[lens_key] = np.array([1.0], dtype=np.float32)
-
-    try:
-        if emb_out_name:
-            outs = _ort_session.run([emb_out_name], feed)
-        else:
-            outs = _ort_session.run(None, feed)
-        emb = outs[0]
-    except Exception as exc:
-        logger.error("ONNX embedding run failed: %s", exc)
-        return None
-
-    vec = np.asarray(emb, dtype=np.float64)
-    if vec.ndim == 3:
-        vec = vec[0, 0]
-    elif vec.ndim == 2:
-        vec = vec[0]
-    elif vec.ndim != 1:
-        logger.error("Unexpected ONNX embedding shape: %s", vec.shape)
-        return None
-
-    norm = np.linalg.norm(vec)
-    if norm < 1e-9:
-        return None
-    return vec / norm
+def get_model_config() -> Dict[str, Any]:
+    return {
+        "model": NEMOTRON_MODEL_ID,
+        "backend": _backend,
+        "device": _device_label,
+        "dtype": _dtype_label,
+        "streaming_mode": DIAR_STREAMING_MODE,
+    }
 
 
 # ---------------------------------------------------------------------------
-# Embedding extraction — whole window
+# Segment parsing (NeMo tuple strings or HF dicts)
 # ---------------------------------------------------------------------------
 
 
-def _extract_embedding(audio: np.ndarray) -> Optional[np.ndarray]:
-    """Extract a unit-normalised speaker embedding from a float32 audio array.
-
-    Strips leading/trailing silence before passing to ECAPA so the model
-    sees dense speech rather than a padded, mostly-silent window.
-    """
-    if not _model_available:
-        return None
-
-    # --- Strip silence: keep only frames above energy threshold ---
-    frame_len = int(0.02 * SAMPLE_RATE)  # 20 ms frames
-    hop_len = int(0.01 * SAMPLE_RATE)  # 10 ms hop
-    speech_frames: List[np.ndarray] = []
-    i = 0
-    while i + frame_len <= len(audio):
-        frame = audio[i : i + frame_len]
-        rms = float(np.sqrt(np.mean(frame**2)))
-        if rms >= MIN_WINDOW_RMS:
-            speech_frames.append(frame)
-        i += hop_len
-
-    if not speech_frames:
-        logger.debug("No speech frames found — skipping embedding")
-        return None
-
-    # Require a minimum amount of actual speech (configurable —
-    # lowered so short utterances can still be embedded).
-    speech_audio = np.concatenate(speech_frames)
-    if len(speech_audio) < int(MIN_EMBED_SPEECH_S * SAMPLE_RATE):
-        logger.debug(
-            "Too little speech (%.2fs) — skipping embedding",
-            len(speech_audio) / SAMPLE_RATE,
+def _parse_segment_entry(
+    entry,
+) -> Optional[Tuple[float, float, int]]:
+    """Return (start_s, end_s, speaker_channel)."""
+    if isinstance(entry, dict):
+        spk = entry.get("Speaker", entry.get("speaker"))
+        if spk is None:
+            return None
+        return (
+            float(entry.get("Start", entry.get("start", 0))),
+            float(entry.get("End", entry.get("end", 0))),
+            int(spk),
         )
-        return None
 
-    speech_f32 = np.ascontiguousarray(speech_audio, dtype=np.float32)
-    return _run_onnx_embedding(speech_f32)
+    if isinstance(entry, (list, tuple)) and len(entry) >= 3:
+        return float(entry[0]), float(entry[1]), int(entry[2])
+
+    if isinstance(entry, str):
+        parts = [p.strip() for p in entry.split(",")]
+        if len(parts) >= 3:
+            return float(parts[0]), float(parts[1]), int(parts[2])
+    return None
 
 
-def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.dot(a, b))  # both are already unit-normalised
+def _overlap_score(
+    seg_start: float, seg_end: float, activities: List[SpeakerActivity]
+) -> Tuple[Optional[str], float]:
+    best_id: Optional[str] = None
+    best_ratio = 0.0
+    seg_dur = max(seg_end - seg_start, 1e-6)
+    for act in activities:
+        ov = max(0.0, min(act.end, seg_end) - max(act.start, seg_start))
+        if ov <= 0:
+            continue
+        ratio = ov / seg_dur
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_id = act.speaker_id
+    return best_id, best_ratio
 
 
 # ---------------------------------------------------------------------------
-# Session state
+# Session — streaming Transformers
 # ---------------------------------------------------------------------------
+
+
+class _TransformersStreamState:
+    def __init__(self) -> None:
+        self.speaker_cache = None
+        self.is_first: bool = True
+        self.mel_frame_idx: Optional[int] = None
+        self.session_pcm: np.ndarray = np.zeros(0, dtype=np.float32)
+        self.time_origin_s: float = 0.0
+        self.logits_parts: List = []
+        self.pending_flush: bool = False
 
 
 class DiarizationSession:
@@ -382,51 +345,255 @@ class DiarizationSession:
         self.session_id = session_id
         self.sample_rate = sample_rate
         self._speakers: Dict[str, Speaker] = {}
+        self._channel_to_id: Dict[int, str] = {}
         self._speaker_counter: int = 0
         self.last_speaker_id: Optional[str] = None
-        # Weak-band embeddings awaiting new-speaker confirmation.
-        self._pending_new: List[np.ndarray] = []
+        self._activities: List[SpeakerActivity] = []
+        self._stream: Optional[_TransformersStreamState] = None
+        if not SINGLE_SPEAKER_MODE:
+            self._stream = _TransformersStreamState()
 
     @property
     def speakers(self) -> List[Speaker]:
         return list(self._speakers.values())
 
+    @property
+    def stream_initialized(self) -> bool:
+        if self._stream is None:
+            return False
+        return len(self._stream.session_pcm) > 0
+
+    def _register_channel(self, channel: int) -> Tuple[Speaker, bool]:
+        if channel in self._channel_to_id:
+            spk = self._speakers[self._channel_to_id[channel]]
+            spk.sample_count += 1
+            return spk, False
+        self._speaker_counter += 1
+        spk_id = f"speaker_{self._speaker_counter:03d}"
+        spk = Speaker(
+            speaker_id=spk_id,
+            display_name=f"Speaker {self._speaker_counter}",
+            nemotron_channel=channel,
+            sample_count=1,
+        )
+        self._speakers[spk_id] = spk
+        self._channel_to_id[channel] = spk_id
+        return spk, True
+
+    def _rebuild_activities_from_logits(self, time_origin_s: float) -> List[Speaker]:
+        if _t_processor is None or _t_model is None or self._stream is None:
+            return []
+        if not self._stream.logits_parts:
+            self._activities.clear()
+            return []
+
+        import torch
+
+        logits = torch.cat(self._stream.logits_parts, dim=1)
+        raw_segments = _t_processor.extract_speaker_dict(logits)
+        segments = raw_segments[0] if raw_segments else []
+
+        new_speakers: List[Speaker] = []
+        self._activities.clear()
+        for entry in segments:
+            parsed = _parse_segment_entry(entry)
+            if parsed is None:
+                continue
+            start_s, end_s, channel = parsed
+            spk, is_new = self._register_channel(channel)
+            if is_new:
+                new_speakers.append(spk)
+            self._activities.append(
+                SpeakerActivity(
+                    speaker_id=spk.speaker_id,
+                    start=round(time_origin_s + start_s, 3),
+                    end=round(time_origin_s + end_s, 3),
+                )
+            )
+        return new_speakers
+
+    def _transformers_forward(self, inputs) -> None:
+        import torch
+
+        assert _t_model is not None and self._stream is not None
+        model_inputs: dict = {}
+        for key, val in inputs.items():
+            if isinstance(val, torch.Tensor):
+                val = val.to(device=_t_device)
+                if val.is_floating_point():
+                    val = val.to(dtype=_t_dtype)
+                model_inputs[key] = val
+            else:
+                model_inputs[key] = val
+        with torch.inference_mode():
+            outputs = _t_model(
+                **model_inputs, speaker_cache=self._stream.speaker_cache
+            )
+        self._stream.speaker_cache = outputs.speaker_cache
+        self._stream.logits_parts.append(outputs.logits.detach().cpu())
+
+    def _drain_transformers_stream(self) -> None:
+        if (
+            self._stream is None
+            or _t_processor is None
+            or _t_model is None
+            or not _model_available
+        ):
+            return
+
+        proc = _t_processor
+        audio = self._stream.session_pcm
+
+        while True:
+            if self._stream.is_first:
+                need = proc.num_samples_first_audio_chunk
+                if len(audio) < need:
+                    break
+                chunk = audio[:need]
+                inputs = proc(
+                    chunk,
+                    sampling_rate=self.sample_rate,
+                    is_streaming=True,
+                    is_first_audio_chunk=True,
+                    return_tensors="pt",
+                )
+                self._stream.is_first = False
+                self._stream.mel_frame_idx = proc.num_mel_frames_per_step
+                self._transformers_forward(inputs)
+                continue
+
+            assert self._stream.mel_frame_idx is not None
+            start_idx = proc.audio_chunk_start(self._stream.mel_frame_idx)
+            end_idx = start_idx + proc.num_samples_per_audio_chunk
+            if end_idx > len(audio):
+                break
+            chunk = audio[start_idx:end_idx]
+            inputs = proc(
+                chunk,
+                sampling_rate=self.sample_rate,
+                is_streaming=True,
+                is_first_audio_chunk=False,
+                return_tensors="pt",
+            )
+            self._stream.mel_frame_idx += proc.num_mel_frames_per_step
+            self._transformers_forward(inputs)
+
+    def _flush_transformers_tail(self) -> None:
+        if (
+            self._stream is None
+            or _t_processor is None
+            or _t_model is None
+            or self._stream.is_first
+        ):
+            return
+
+        proc = _t_processor
+        audio = self._stream.session_pcm
+        if self._stream.mel_frame_idx is None:
+            return
+        start_idx = proc.audio_chunk_start(self._stream.mel_frame_idx)
+        if start_idx >= len(audio):
+            return
+        tail = audio[start_idx:]
+        if len(tail) < int(0.08 * self.sample_rate):
+            return
+
+        inputs = proc(
+            tail,
+            sampling_rate=self.sample_rate,
+            is_streaming=True,
+            is_first_audio_chunk=False,
+            is_last_audio_chunk=True,
+            return_tensors="pt",
+        )
+        self._transformers_forward(inputs)
+        self._stream.is_first = True
+        self._stream.mel_frame_idx = None
+
+    def _nemo_diarize_window(
+        self, audio: np.ndarray, window_start_s: float
+    ) -> List[Speaker]:
+        if _nemo_model is None:
+            return []
+        predicted = _nemo_model.diarize(
+            audio=[np.ascontiguousarray(audio, dtype=np.float32)],
+            batch_size=1,
+            sample_rate=self.sample_rate,
+        )
+        rows = predicted[0] if predicted else []
+        new_speakers: List[Speaker] = []
+        window_activities: List[SpeakerActivity] = []
+        for entry in rows or []:
+            parsed = _parse_segment_entry(entry)
+            if parsed is None:
+                continue
+            rel_start, rel_end, channel = parsed
+            spk, is_new = self._register_channel(channel)
+            if is_new:
+                new_speakers.append(spk)
+            act = SpeakerActivity(
+                speaker_id=spk.speaker_id,
+                start=round(window_start_s + rel_start, 3),
+                end=round(window_start_s + rel_end, 3),
+            )
+            window_activities.append(act)
+        self._activities = window_activities
+        return new_speakers
+
+    def stream_audio(
+        self, audio: np.ndarray, chunk_start_s: float
+    ) -> Tuple[List[SpeakerActivity], List[Speaker]]:
+        """Append PCM at `chunk_start_s`, run streaming diarization, return updates."""
+        if SINGLE_SPEAKER_MODE or not _model_available:
+            return [], []
+
+        with _model_lock:
+            if _backend == "nemo":
+                new_spk = self._nemo_diarize_window(audio, chunk_start_s)
+                return list(self._activities), new_spk
+
+            assert self._stream is not None
+            if len(self._stream.session_pcm) == 0:
+                self._stream.time_origin_s = chunk_start_s
+            elif len(audio):
+                expected = self._stream.time_origin_s + (
+                    len(self._stream.session_pcm) / self.sample_rate
+                )
+                if abs(expected - chunk_start_s) > 0.25:
+                    logger.warning(
+                        "Diarization timeline drift %.3fs (expected %.3f got %.3f) — "
+                        "appending anyway; check that diar runs on every window",
+                        expected - chunk_start_s,
+                        expected,
+                        chunk_start_s,
+                    )
+
+            if len(audio):
+                self._stream.session_pcm = np.concatenate(
+                    [self._stream.session_pcm, np.ascontiguousarray(audio, dtype=np.float32)]
+                )
+                self._drain_transformers_stream()
+
+            new_speakers = self._rebuild_activities_from_logits(
+                self._stream.time_origin_s
+            )
+            return list(self._activities), new_speakers
+
+    def flush(self) -> Tuple[List[SpeakerActivity], List[Speaker]]:
+        if SINGLE_SPEAKER_MODE or not _model_available or _backend != "transformers":
+            return [], []
+        with _model_lock:
+            assert self._stream is not None
+            self._flush_transformers_tail()
+            new_speakers = self._rebuild_activities_from_logits(
+                self._stream.time_origin_s
+            )
+            return list(self._activities), new_speakers
+
     def process_chunk(
         self, audio: np.ndarray, chunk_start_s: float
     ) -> Tuple[List[SpeakerActivity], List[Speaker]]:
-        """
-        Extract ONE embedding from the whole window and match/create a speaker.
-
-        Returns (activities, new_speakers).
-        activities covers [chunk_start_s, chunk_start_s + duration].
-        """
-        if not _model_available:
-            return [], []
-
-        # Skip windows that are mostly silence.
-        window_rms = float(np.sqrt(np.mean(audio**2)))
-        if window_rms < MIN_WINDOW_RMS:
-            logger.debug(
-                "Skipping window (RMS=%.4f < %.4f)", window_rms, MIN_WINDOW_RMS
-            )
-            return [], []
-
-        embedding = _extract_embedding(audio)
-        if embedding is None:
-            return [], []
-
-        speaker, is_new, _score = self._match_or_create_speaker(embedding)
-        self.last_speaker_id = speaker.speaker_id
-        duration = len(audio) / self.sample_rate
-
-        activity = SpeakerActivity(
-            speaker_id=speaker.speaker_id,
-            start=round(chunk_start_s, 3),
-            end=round(chunk_start_s + duration, 3),
-        )
-
-        new_speakers = [speaker] if is_new else []
-        return [activity], new_speakers
+        return self.stream_audio(audio, chunk_start_s)
 
     def process_segment(
         self,
@@ -435,187 +602,25 @@ class DiarizationSession:
         seg_end_s: float,
         allow_new_speaker: bool = True,
     ) -> Tuple[Optional[Speaker], bool, float]:
-        """
-        Identify the speaker of a single transcript segment.
+        del audio, allow_new_speaker  # Nemotron labels come from stream overlap
+        if SINGLE_SPEAKER_MODE:
+            spk = self._speakers.get(SOLE_SPEAKER_ID)
+            if spk is None:
+                spk = Speaker(
+                    speaker_id=SOLE_SPEAKER_ID,
+                    display_name=SOLE_SPEAKER_DISPLAY,
+                    sample_count=1,
+                )
+                self._speakers[SOLE_SPEAKER_ID] = spk
+            return spk, False, 1.0
 
-        `audio` must be the slice of PCM that produced the segment (with a
-        small pad already applied by the caller).  Matching a per-segment
-        embedding — rather than one embedding for the whole 4 s window —
-        is what keeps speaker identity correct when two people speak in
-        quick succession inside the same window.
-
-        Returns (speaker, is_new, best_score).  speaker is None when the
-        slice has too little speech to embed; the caller should then fall
-        back to continuity heuristics.
-        """
         if not _model_available:
             return None, False, -1.0
 
-        embedding = _extract_embedding(audio)
-        if embedding is None:
+        spk_id, score = _overlap_score(seg_start_s, seg_end_s, self._activities)
+        if spk_id is None:
             return None, False, -1.0
-
-        speaker, is_new, score = self._match_or_create_speaker(
-            embedding, allow_new_speaker=allow_new_speaker
-        )
-        self.last_speaker_id = speaker.speaker_id
-        return speaker, is_new, score
-
-    def _should_match_existing(
-        self,
-        best_id: Optional[str],
-        best_score: float,
-        second_best_score: float,
-        num_registered: int,
-    ) -> bool:
-        if best_id is None:
-            return False
-        if best_score >= SPEAKER_SIMILARITY_THRESHOLD:
-            return True
-        if best_score < SPEAKER_CONTINUITY_FLOOR:
-            return False
-        # Weak band [floor, threshold): need a decisive best vs second-best when
-        # *two or more* centroids exist. With only one centroid, second_best is
-        # sentinel (-1); the old check always passed and merged everyone into S1.
-        if num_registered >= 2:
-            if best_score - second_best_score < SPEAKER_MATCH_MARGIN:
-                return False
-        # One registered voice — weak band rules for lone centroid.
-        if num_registered == 1:
-            if WEAK_MATCH_LONE_SPEAKER_RELAXATION:
-                single_speaker_floor = max(
-                    SPEAKER_CONTINUITY_FLOOR,
-                    SPEAKER_SIMILARITY_THRESHOLD * 0.75,
-                )
-                return best_score >= single_speaker_floor
-            # Merge weak scores in [LONE_SPEAKER_WEAK_MERGE_MIN, threshold).
-            if LONE_SPEAKER_WEAK_MERGE_MIN >= SPEAKER_SIMILARITY_THRESHOLD:
-                return False
-            return (
-                best_score >= LONE_SPEAKER_WEAK_MERGE_MIN
-                and best_score < SPEAKER_SIMILARITY_THRESHOLD
-            )
-        # Multiple speakers, weak band: margin already enforced that best beats second.
-        # The old `second < floor` rule rejected whenever second was ≥ floor (e.g.
-        # 0.19 vs floor 0.18), fragmenting one voice into speaker_003, speaker_004, …
-        return True
-
-    def _match_or_create_speaker(
-        self, embedding: np.ndarray, allow_new_speaker: bool = True
-    ) -> Tuple[Speaker, bool, float]:
-        scores: List[Tuple[str, float]] = []
-
-        for spk_id, spk in self._speakers.items():
-            if spk.embedding is None:
-                continue
-            score = _cosine_similarity(embedding, spk.embedding)
-            scores.append((spk_id, score))
-
-        scores.sort(key=lambda item: item[1], reverse=True)
-        best_id: Optional[str] = scores[0][0] if scores else None
-        best_score: float = scores[0][1] if scores else -1.0
-        second_best_score: float = scores[1][1] if len(scores) > 1 else -1.0
-
-        n_reg = len(self._speakers)
-        matched = self._should_match_existing(
-            best_id, best_score, second_best_score, n_reg
-        )
-
-        if LOG_DIAR_SCORES and scores:
-            parts = ", ".join(f"{sid}={sc:.3f}" for sid, sc in scores)
-            logger.info("Diar scores (%d speakers): %s", n_reg, parts)
-
-        if scores:
-            logger.info(
-                "Speaker match: best_score=%.3f second=%.3f n_spk=%d threshold=%.3f floor=%.3f margin=%.3f lone_min=%.3f → %s",
-                best_score,
-                second_best_score,
-                n_reg,
-                SPEAKER_SIMILARITY_THRESHOLD,
-                SPEAKER_CONTINUITY_FLOOR,
-                SPEAKER_MATCH_MARGIN,
-                LONE_SPEAKER_WEAK_MERGE_MIN,
-                f"matched {best_id}" if matched else "NEW SPEAKER",
-            )
-        else:
-            logger.info("Speaker match: no registered speakers → NEW SPEAKER (first)")
-
-        if matched and best_id is not None:
-            self._pending_new.clear()
-            spk = self._speakers[best_id]
-            # Slow EMA update — keeps identity stable while adapting to drift.
-            alpha = EMBEDDING_SMOOTHING_ALPHA
-            updated = (1 - alpha) * spk.embedding + alpha * embedding
-            norm = np.linalg.norm(updated)
-            spk.embedding = updated / max(norm, 1e-9)
-            spk.sample_count += 1
-            logger.info(
-                "Matched %s (score=%.3f, n=%d)",
-                spk.speaker_id,
-                best_score,
-                spk.sample_count,
-            )
-            return spk, False, best_score
-
-        # Short/unreliable segments may not create new speakers — assign the
-        # best existing identity instead of fragmenting the roster.
-        if not matched and not allow_new_speaker and best_id is not None:
-            spk = self._speakers[best_id]
-            spk.sample_count += 1
-            logger.info(
-                "Weak short-segment match → %s (score=%.3f, n=%d)",
-                spk.speaker_id,
-                best_score,
-                spk.sample_count,
-            )
-            return spk, False, best_score
-
-        # Weak-band evidence (score >= floor but below threshold, or a lost
-        # margin between two centroids): a single noisy embedding must not
-        # mint a new identity. Hold the segment on the best existing speaker
-        # until NEW_SPEAKER_CONFIRM_COUNT consecutive weak embeddings agree.
-        # Scores below the floor mean a genuinely different voice — those
-        # still create a new speaker immediately.
-        pending_pool: List[np.ndarray] = []
-        if (
-            allow_new_speaker
-            and best_id is not None
-            and best_score >= SPEAKER_CONTINUITY_FLOOR
-        ):
-            self._pending_new.append(embedding.copy())
-            if len(self._pending_new) < NEW_SPEAKER_CONFIRM_COUNT:
-                spk = self._speakers[best_id]
-                spk.sample_count += 1
-                logger.info(
-                    "Weak-band match held on %s (score=%.3f, pending=%d/%d)",
-                    spk.speaker_id,
-                    best_score,
-                    len(self._pending_new),
-                    NEW_SPEAKER_CONFIRM_COUNT,
-                )
-                return spk, False, best_score
-            pending_pool = self._pending_new
-
-        self._pending_new.clear()
-
-        # New speaker. When confirmation embeddings were collected, seed the
-        # centroid with their mean — more stable than the single last clip.
-        new_embedding = embedding
-        if pending_pool:
-            stacked = np.stack(pending_pool)
-            avg = stacked.mean(axis=0)
-            norm = np.linalg.norm(avg)
-            if norm > 1e-9:
-                new_embedding = avg / norm
-
-        self._speaker_counter += 1
-        spk_id = f"speaker_{self._speaker_counter:03d}"
-        new_spk = Speaker(
-            speaker_id=spk_id,
-            display_name=f"Speaker {self._speaker_counter}",
-            embedding=new_embedding,
-            sample_count=1,
-        )
-        self._speakers[spk_id] = new_spk
-        logger.info("New speaker created: %s (best_score=%.3f)", spk_id, best_score)
-        return new_spk, True, best_score
+        spk = self._speakers[spk_id]
+        spk.sample_count += 1
+        self.last_speaker_id = spk_id
+        return spk, False, score

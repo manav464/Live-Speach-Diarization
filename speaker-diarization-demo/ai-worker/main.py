@@ -16,7 +16,7 @@ Audio flow:
   2. Both ASR and diarization share a single accumulation buffer per session.
   3. When the buffer exceeds WINDOW_S seconds we slice it, run:
        a. Faster-Whisper ASR  → transcript segments with timestamps
-       b. ECAPA ONNX embeddings → speaker activities with timestamps
+       b. Nemotron-3-Diarization → speaker activities with timestamps
        c. Overlap matching    → assign speaker_id to each segment
   4. Results are emitted to the frontend.
   5. Buffer advances by STEP_S (window - overlap), preserving context.
@@ -58,13 +58,12 @@ PORT: int = int(os.getenv("PORT", "8000"))
 SAMPLE_RATE: int = int(os.getenv("SAMPLE_RATE", "16000"))
 
 # Processing window length in seconds.  Both ASR and diarization process
-# this exact slice.  4 s ensures enough speech density for stable ECAPA
-# embeddings even when the speaker pauses briefly.
-WINDOW_S: float = float(os.getenv("WINDOW_S", "4.0"))
+# this exact slice.  4 s gives Nemotron enough context per streaming step.
+WINDOW_S: float = float(os.getenv("WINDOW_S", "1.5"))
 
 # Step size: how far to advance the buffer after each window.
 # WINDOW_S - STEP_S = overlap kept for ASR context at boundaries.
-STEP_S: float = float(os.getenv("STEP_S", "3.0"))
+STEP_S: float = float(os.getenv("STEP_S", "1.0"))
 
 WINDOW_SAMPLES: int = int(WINDOW_S * SAMPLE_RATE)
 STEP_SAMPLES: int = int(STEP_S * SAMPLE_RATE)
@@ -152,13 +151,8 @@ def _find_speaker(
     return best_id
 
 
-# Extra audio padded around each transcript segment before embedding, so the
-# ECAPA model sees a little leading/trailing context.
+# Kept for segment slicing; Nemotron labels are aligned via stream overlap.
 SEGMENT_PAD_S: float = float(os.getenv("SEGMENT_PAD_S", "0.15"))
-
-# Segments shorter than this may match existing speakers but may NOT create
-# new ones — sub-second utterances produce unreliable ECAPA embeddings and
-# were the main source of spurious speaker_NNN identities.
 MIN_NEW_SPEAKER_SEG_S: float = float(os.getenv("MIN_NEW_SPEAKER_SEG_S", "1.0"))
 
 
@@ -387,14 +381,10 @@ async def _assign_speaker(
     window_start_s: float,
     seg: TranscriptSegment,
 ) -> Tuple[Optional[str], float, str]:
-    """Identify the speaker for one transcript segment.
-
-    Extracts an embedding from just the segment's audio slice (plus a
-    small pad) — not the whole 4 s window — so two speakers talking in
-    quick succession inside one window get separate identities.
+    """Identify the speaker for one transcript segment via Nemotron activities.
 
     Returns (speaker_id, match_score, method) where method is one of
-    "embedding", "overlap", "last", or "none".  speaker_id may be None.
+    "nemotron", "overlap", "last", or "none".  speaker_id may be None.
     """
     session_id = session.session_id
     sr = SAMPLE_RATE
@@ -412,43 +402,22 @@ async def _assign_speaker(
         return diar_module.SOLE_SPEAKER_ID, 1.0, "single_mode"
 
     if i1 - i0 >= int(0.3 * sr) and diar_module.is_model_ready():
-        slice_audio = audio[i0:i1]
         try:
-            allow_new = (seg.end - seg.start) >= MIN_NEW_SPEAKER_SEG_S
             spk, is_new, score = session.diar.process_segment(
-                slice_audio, seg.start, seg.end,
-                allow_new_speaker=allow_new,
+                audio[i0:i1], seg.start, seg.end,
+                allow_new_speaker=(seg.end - seg.start) >= MIN_NEW_SPEAKER_SEG_S,
             )
             match_score = score
             if spk is not None:
                 speaker_id = spk.speaker_id
-                session.activities.append(
-                    SpeakerActivity(
-                        speaker_id=speaker_id,
-                        start=round(seg.start, 3),
-                        end=round(seg.end, 3),
-                    )
-                )
-                if is_new:
-                    logger.info(
-                        "Speaker detected: %s in session %s",
-                        speaker_id, session_id,
-                    )
-                    await ws.send(
-                        _make_msg(
-                            type="speaker.created",
-                            session_id=session_id,
-                            speaker_id=speaker_id,
-                            display_name=spk.display_name,
-                        )
-                    )
+                return speaker_id, match_score, "nemotron"
         except Exception as exc:
             logger.error("Diarization error: %s", exc)
 
-    # Fallback chain when the segment was too short/quiet to embed:
+    # Fallback chain when Nemotron has no overlapping label yet:
     # greatest-overlap activity → last identified speaker.
     if speaker_id is not None:
-        return speaker_id, match_score, "embedding"
+        return speaker_id, match_score, "nemotron"
     speaker_id = _find_speaker(session.activities, seg.start, seg.end)
     if speaker_id is not None:
         return speaker_id, match_score, "overlap"
@@ -463,6 +432,24 @@ async def _assign_speaker(
 # Core processing: one window → ASR + diarization → aligned events
 # ---------------------------------------------------------------------------
 
+def _feed_diar_window_sync(
+    session: Session,
+    audio: np.ndarray,
+    window_start_s: float,
+) -> Tuple[List[SpeakerActivity], List]:
+    """CPU-bound Nemotron streaming (run in a thread)."""
+    if not diar_module.is_model_ready() or diar_module.SINGLE_SPEAKER_MODE:
+        return [], []
+    if not session.diar.stream_initialized:
+        diar_chunk = audio
+        diar_start = window_start_s
+    else:
+        overlap_skip = int(max(0.0, WINDOW_S - STEP_S) * SAMPLE_RATE)
+        diar_chunk = audio[overlap_skip:]
+        diar_start = window_start_s + (WINDOW_S - STEP_S)
+    return session.diar.stream_audio(diar_chunk, diar_start)
+
+
 async def _process_window(
     ws: websockets.WebSocketServerProtocol,
     session: Session,
@@ -470,17 +457,46 @@ async def _process_window(
     window_start_s: float,
     is_flush: bool = False,
 ) -> None:
-    """Run ASR then diarization on `audio`, emit aligned transcript events."""
+    """Run diarization + ASR on `audio`, emit aligned transcript events."""
     session_id = session.session_id
 
-    # ── ASR ────────────────────────────────────────────────────────────── #
+    # Diar + ASR in parallel (no extra sleep; both are CPU/GPU bound).
     asr_segments: List[TranscriptSegment] = []
-    if asr_module.is_model_ready():
+
+    async def _run_diar() -> Tuple[List[SpeakerActivity], List]:
         try:
-            asr_segments = session.asr.transcribe_window(audio, window_start_s)
+            return await asyncio.to_thread(
+                _feed_diar_window_sync, session, audio, window_start_s
+            )
+        except Exception as exc:
+            logger.error("Nemotron stream error: %s", exc)
+            return [], []
+
+    async def _run_asr() -> List[TranscriptSegment]:
+        if not asr_module.is_model_ready():
+            return []
+        try:
+            return await asyncio.to_thread(
+                session.asr.transcribe_window, audio, window_start_s
+            )
         except Exception as exc:
             logger.error("ASR error: %s", exc)
             await ws.send(_make_msg(type="pipeline.error", message=str(exc)))
+            return []
+
+    (activities, new_speakers), asr_segments = await asyncio.gather(
+        _run_diar(), _run_asr()
+    )
+    session.activities = activities
+    for spk in new_speakers:
+        await ws.send(
+            _make_msg(
+                type="speaker.created",
+                session_id=session_id,
+                speaker_id=spk.speaker_id,
+                display_name=spk.display_name,
+            )
+        )
 
     if not asr_segments:
         return  # nothing to emit
@@ -503,8 +519,7 @@ async def _process_window(
         if seg is None:
             continue
 
-        # Per-segment diarization: embed only this segment's audio so
-        # successive speakers inside one window keep separate identities.
+        # Per-segment speaker label via Nemotron activity overlap.
         activity_count = len(session.activities)
         speaker_id, match_score, assign_method = await _assign_speaker(
             ws, session, audio, window_start_s, seg
@@ -602,6 +617,7 @@ async def _handle_start_session(
             asr_error=asr_module.get_model_error(),
             diarization_error=diar_module.get_model_error(),
             asr_config=asr_module.get_model_config(),
+            diar_config=diar_module.get_model_config(),
         )
     )
 
@@ -690,6 +706,22 @@ async def _handle_end_session(
 
     logger.info("Flushing session: %s", session_id)
 
+    if diar_module.is_model_ready() and not diar_module.SINGLE_SPEAKER_MODE:
+        try:
+            activities, new_speakers = session.diar.flush()
+            session.activities = activities
+            for spk in new_speakers:
+                await ws.send(
+                    _make_msg(
+                        type="speaker.created",
+                        session_id=session_id,
+                        speaker_id=spk.speaker_id,
+                        display_name=spk.display_name,
+                    )
+                )
+        except Exception as exc:
+            logger.error("Nemotron flush error: %s", exc)
+
     # Process whatever remains in the buffer.
     if len(session.buffer) > 0:
         await _process_window(
@@ -731,6 +763,7 @@ async def handle_connection(ws: websockets.WebSocketServerProtocol) -> None:
             diarization_ready=diar_module.is_model_ready(),
             diarization_error=diar_module.get_model_error(),
             asr_config=asr_module.get_model_config(),
+            diar_config=diar_module.get_model_config(),
         )
     )
 
@@ -784,7 +817,7 @@ async def main() -> None:
     logger.info("Unified window pipeline: window=%.1fs step=%.1fs", WINDOW_S, STEP_S)
     if diar_module.SINGLE_SPEAKER_MODE:
         logger.info(
-            "SINGLE_SPEAKER_MODE is on — all speech labeled %s; ECAPA not loaded",
+            "SINGLE_SPEAKER_MODE is on — all speech labeled %s; Nemotron not loaded",
             diar_module.SOLE_SPEAKER_ID,
         )
 

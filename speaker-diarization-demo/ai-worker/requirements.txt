@@ -4,14 +4,17 @@ numpy==2.2.6
 scipy==1.15.3
 python-dotenv==1.0.1
 
-# Speaker embedding (ECAPA-TDNN ONNX)
-onnxruntime==1.20.1
-
-# Speech recognition
+# Speech recognition (CPU via CTranslate2)
 faster-whisper==1.1.1
 
-# HF Hub — downloads the default ECAPA ONNX on first diarization load
-huggingface-hub==0.24.7
+# Nemotron-3-Diarization (Transformers — requires recent transformers for RoPE encoder)
+torch>=2.6.0
+transformers>=4.57.0
+huggingface-hub>=0.34.0
+safetensors>=0.4.0
+
+# Optional NeMo backend (DIAR_BACKEND=nemo); needs a NeMo build with RoPE encoder support
+# nemo-toolkit[asr]>=3.0.0
 
 # Audio utilities
 librosa==0.10.2

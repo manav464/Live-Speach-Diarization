@@ -1,8 +1,8 @@
 # Real-Time Speaker Diarization Demo
 
-A local, CPU-only demo application for real-time speech transcription with speaker identification (diarization).
+A local demo for real-time speech transcription with speaker diarization using [nvidia/Nemotron-3-Diarization](https://huggingface.co/nvidia/Nemotron-3-Diarization).
 
-> **Note:** This is a demonstration prototype built to run on CPU hardware without any GPU, CUDA, cloud APIs, or paid services. It is not the final production architecture (which would use Nemotron-3 on GPU).
+> **Note:** ASR stays on CPU (Faster-Whisper). Diarization uses PyTorch and **prefers GPU when CUDA is available**, otherwise CPU. No cloud APIs required.
 
 ---
 
@@ -22,8 +22,8 @@ Python AI Worker  :8000
       +------------------+
       |                  |
       v                  v
- Faster-Whisper       ECAPA (ONNX)
- (ASR / STT)        (Speaker Embeddings)
+ Faster-Whisper    Nemotron-3-Diarization
+ (ASR / STT)     (streaming Sortformer)
       |                  |
       +--------+---------+
                |
@@ -54,7 +54,7 @@ All other messages (transcript events, speaker events, status) are JSON text fra
 | Backend gateway     | Node.js 20 + Express + ws                               |
 | AI worker           | Python 3.10+ + websockets + asyncio                     |
 | Speech recognition  | Faster-Whisper via CTranslate2 (CPU / int8; no PyTorch) |
-| Speaker diarization | ECAPA-TDNN ONNX embeddings (ONNX Runtime; no PyTorch)   |
+| Speaker diarization | Nemotron-3-Diarization via Transformers (GPU or CPU)    |
 | Audio capture       | Browser Web Audio API (getUserMedia)                    |
 
 ---
@@ -89,9 +89,9 @@ python3 -m venv .venv
 ./.venv/bin/python -c "import sys; print(sys.executable)"
 ```
 
-> **First run:** Faster-Whisper will download the `small.en` model (~460 MB) and
-> the default ECAPA speaker ONNX (~80 MB; fetched from Hugging Face when
-> diarization first loads). Both are cached locally and reused on subsequent runs.
+> **First run:** Faster-Whisper downloads `small.en` (~460 MB). Nemotron-3-Diarization
+> (~400 MB weights) is fetched from Hugging Face when diarization first loads. Models
+> are cached under `ai-worker/pretrained_models/`.
 
 Copy `.env.example` to `.env` and adjust settings if needed:
 
@@ -226,27 +226,18 @@ VAD_ENERGY_THRESHOLD=0.0015
 VAD_THRESHOLD=0.4
 VAD_MIN_SILENCE_MS=200
 VAD_SPEECH_PAD_MS=120
-SPEAKER_SIMILARITY_THRESHOLD=0.42   # raise if different people merge; lower if one splits
-SPEAKER_CONTINUITY_FLOOR=0.18   # below this, no speaker matches; weak band uses margin vs 2nd-best
-SPEAKER_MATCH_MARGIN=0.06
-WEAK_MATCH_LONE_SPEAKER_RELAXATION=false   # true = legacy 75%-of-threshold merge when only Speaker 1 exists
-LONE_SPEAKER_WEAK_MERGE_MIN=0.30         # solo weak-band merge floor; lower if one voice splits into speaker_002
-SINGLE_SPEAKER_MODE=false                  # true = force one label (disables ECAPA for that run)
-LOG_DIAR_SCORES=false                      # true = log similarity vs every speaker (debug)
-ALLOW_LAST_SPEAKER_FALLBACK=true           # short clips inherit last speaker (less Unknown)
-MIN_NEW_SPEAKER_SEG_S=1.2           # shorter utterances won't spawn a new ID
-MIN_EMBED_SPEECH_S=0.3
-MIN_WINDOW_RMS=0.015
-SEGMENT_PAD_S=0.15
+DIAR_DEVICE=auto                 # auto | cpu | cuda — GPU when available
+DIAR_PRECISION=auto              # auto | fp32 | fp16 | bf16
+DIAR_BACKEND=transformers          # transformers | nemo | auto
+DIAR_STREAMING_MODE=low_latency    # low_latency | very_low_latency | ultra_low_latency
+SINGLE_SPEAKER_MODE=false
+ALLOW_LAST_SPEAKER_FALLBACK=true
 WINDOW_S=4.0
 STEP_S=3.0
-RESOLVE_TIMELINE_OVERLAP=true    # clip timestamps so lines do not overlap
+RESOLVE_TIMELINE_OVERLAP=true
 MIN_EMIT_DURATION_S=0.05
-EMBEDDING_SMOOTHING_ALPHA=0.08
-# ECAPA ONNX (defaults — see "Speaker Diarization" below):
-# ECAPA_ONNX_REPO_ID=kenrunio/transcriber-speaker-onnx
-# ECAPA_ONNX_FILENAME=ecapa-any-length.onnx
-# ECAPA_ONNX_CACHE_DIR=pretrained_models/ecapa_onnx
+# NEMOTRON_MODEL_ID=nvidia/Nemotron-3-Diarization
+# DIAR_CACHE_DIR=pretrained_models/nemotron_diar
 ```
 
 The worker reports its active ASR model, language, device, compute type, and
@@ -260,11 +251,10 @@ final partial audio chunk when recording stops.
 
 ## AI Models
 
-### Dependencies (no PyTorch in the worker)
+### Dependencies
 
-- **ASR:** Faster-Whisper runs the converted OpenAI Whisper weights through **CTranslate2** (same stack as upstream `faster-whisper`).
-- **Diarization:** **ONNX Runtime** loads the ECAPA speaker embedding network only.
-- PyTorch / SpeechBrain are **not** used by the application code. Do not install `torch` in the worker venv unless you add optional tooling yourself.
+- **ASR:** Faster-Whisper runs Whisper weights through **CTranslate2** (CPU; no PyTorch for ASR).
+- **Diarization:** **PyTorch + Transformers** load `nvidia/Nemotron-3-Diarization` (~100M parameters). Optional NeMo backend if `DIAR_BACKEND=nemo` and a RoPE-capable NeMo build is installed.
 
 ### Speech Recognition — Faster-Whisper
 
@@ -276,70 +266,35 @@ final partial audio chunk when recording stops.
 - Models are downloaded on first use; set `WHISPER_MODEL_CACHE_DIR` in `.env` to keep them under `ai-worker/pretrained_models/` (see `.env.example`).
 - Tune CPU use with `WHISPER_CPU_THREADS` (CTranslate2 `cpu_threads`; `0` = default).
 
-### Speaker Diarization — ECAPA-TDNN (ONNX)
-
-This demo does **not** run full offline diarization (clustering + overlap detection). It performs **online speaker identification**: each transcript segment gets a speaker label by comparing a fresh voice embedding to speakers already seen in that meeting session.
-
-#### Model in use (default)
+### Speaker Diarization — Nemotron-3-Diarization
 
 | Item | Value |
 | --- | --- |
-| **Hub repository** | [`kenrunio/transcriber-speaker-onnx`](https://huggingface.co/kenrunio/transcriber-speaker-onnx) |
-| **ONNX file** | `ecapa-any-length.onnx` (`ECAPA_ONNX_FILENAME`) |
-| **Architecture** | ECAPA-TDNN speaker embedding network (community ONNX export aligned with SpeechBrain-style 192-dim x-vectors) |
-| **License / source** | See the model card on Hugging Face (Apache-2.0 for the published ONNX) |
-| **Download size** | ~80–85 MB on first run |
-| **Local cache** | `ai-worker/pretrained_models/ecapa_onnx/` (`ECAPA_ONNX_CACHE_DIR`) |
-| **Inference** | [ONNX Runtime](https://onnxruntime.ai/) with `CPUExecutionProvider` only (no GPU, no PyTorch) |
-
-Override the default without code changes:
-
-```env
-ECAPA_ONNX_REPO_ID=kenrunio/transcriber-speaker-onnx
-ECAPA_ONNX_FILENAME=ecapa-any-length.onnx
-# Or use a file you already have:
-# ECAPA_ONNX_PATH=C:\path\to\ecapa-any-length.onnx
-# ECAPA_ONNX_MAX_SAMPLES=0   # 0 = pass full clip; set only for fixed-shape graphs
-```
-
-Set `SINGLE_SPEAKER_MODE=true` to skip loading ECAPA entirely and label every line as `Speaker 1`.
-
-#### ONNX inputs and outputs
-
-The worker auto-detects tensor names (see `diarization.py` → `_classify_onnx_io`). For the default **kenrunio** graph:
-
-- **Input:** mono PCM as `float32`, shape `[1, num_samples]` at **16 kHz** (`SAMPLE_RATE`)
-- **Optional input:** sequence length / `lens` (set to `1.0` = no padding)
-- **Output:** speaker embedding vector; post-processed to **L2-normalized** `float64` (cosine similarity = dot product)
-
-Variable-length audio is supported (`ecapa-any-length`); the worker may truncate to `ECAPA_ONNX_MAX_SAMPLES` if you point at a fixed-length export.
-
-Other ONNX ECAPA exports (e.g. `Pawls2theWall/equivl-ecapa-voxceleb-onnx`) can work if they expose waveform + embedding outputs with similar naming; set `ECAPA_ONNX_REPO_ID` / `ECAPA_ONNX_PATH` accordingly.
+| **Model** | [`nvidia/Nemotron-3-Diarization`](https://huggingface.co/nvidia/Nemotron-3-Diarization) |
+| **Backend** | Hugging Face **Transformers** (default) or NeMo when supported |
+| **Device** | `DIAR_DEVICE=auto` → CUDA if available, else CPU |
+| **Streaming** | Sortformer + speaker cache (`DIAR_STREAMING_MODE`, default `low_latency` ≈ 1 s buffer) |
+| **Cache** | `ai-worker/pretrained_models/nemotron_diar/` (`DIAR_CACHE_DIR`) |
 
 #### How the app uses the model
 
-1. **ASR** (Faster-Whisper) produces timed text segments inside each 4 s processing window (`WINDOW_S` / `STEP_S`).
-2. For each segment, the worker crops the matching slice of PCM (plus `SEGMENT_PAD_S`) and runs ECAPA **per segment** — not one embedding for the whole window — so two people talking in quick succession stay separable.
-3. Before ONNX, high-energy frames are kept (20 ms frames, `MIN_WINDOW_RMS`); at least `MIN_EMBED_SPEECH_S` of speech is required or embedding is skipped.
-4. **Matching:** cosine similarity against each enrolled speaker in the **current session only**; thresholds in `.env` control same-speaker vs new-speaker (`SPEAKER_SIMILARITY_THRESHOLD`, `SPEAKER_CONTINUITY_FLOOR`, `SPEAKER_MATCH_MARGIN`, lone-speaker weak merge).
-5. **Enrollment:** new speakers get IDs like `speaker_001`, `speaker_002`; centroids are updated with EMA (`EMBEDDING_SMOOTHING_ALPHA`). Weak evidence may require `NEW_SPEAKER_CONFIRM_COUNT` consecutive weak hits before minting a new ID (default `2` in code if unset).
-6. **Fallbacks** (no ECAPA score): time-overlap with prior activities, then optionally `ALLOW_LAST_SPEAKER_FALLBACK` for very short clips.
+1. **Streaming PCM** is fed into Nemotron incrementally each ASR window (only **new** audio after the first window, to avoid double-counting overlap).
+2. Nemotron returns **who spoke when** (up to 8 speakers, arrival-ordered channels mapped to `speaker_001`, …).
+3. **ASR** segments are labeled by **time overlap** with Nemotron activities; `ALLOW_LAST_SPEAKER_FALLBACK` covers short gaps.
+4. On session end, a **flush** pass scores any trailing audio still in the streaming buffer.
 
-Speaker state is **per WebSocket session** (per meeting tab), not shared across concurrent meetings.
+Set `SINGLE_SPEAKER_MODE=true` to skip loading Nemotron and label every line as `Speaker 1`.
 
-#### Diarization-related `.env` knobs (summary)
+#### Diarization `.env` knobs
 
 | Variable | Role |
 | --- | --- |
-| `SPEAKER_SIMILARITY_THRESHOLD` | Strong match: same speaker |
-| `SPEAKER_CONTINUITY_FLOOR` | Below this: no match |
-| `SPEAKER_MATCH_MARGIN` | Weak band: best must beat second-best by this margin (≥2 speakers) |
-| `LONE_SPEAKER_WEAK_MERGE_MIN` | With one enrolled speaker: weak merge floor |
-| `MIN_NEW_SPEAKER_SEG_S` | Minimum segment duration to allow creating a new speaker ID |
-| `MIN_EMBED_SPEECH_S` / `MIN_WINDOW_RMS` | Gate embedding extraction |
-| `LOG_DIAR_SCORES` | Log cosine vs every enrolled speaker (tuning) |
-
-Worker logs on startup list resolved ONNX **input** and **output** tensor names after load. Tune thresholds with two-speaker tests and `LOG_DIAR_SCORES=true` if identities merge or split incorrectly.
+| `DIAR_DEVICE` | `auto`, `cpu`, or `cuda` |
+| `DIAR_PRECISION` | `auto`, `fp32`, `fp16`, `bf16` |
+| `DIAR_BACKEND` | `transformers` (recommended on Windows), `nemo`, or `auto` |
+| `DIAR_STREAMING_MODE` | Latency preset: `low_latency`, `very_low_latency`, `ultra_low_latency`, `offline` |
+| `SINGLE_SPEAKER_MODE` | Skip Nemotron; single label |
+| `ALLOW_LAST_SPEAKER_FALLBACK` | Inherit last speaker when no overlap yet |
 
 ---
 
@@ -357,7 +312,7 @@ Worker logs on startup list resolved ONNX **input** and **output** tensor names 
 1. Start all three services.
 2. Have two people take turns speaking (at least 1–2 seconds each turn).
 3. Verify that "Speaker 1" and "Speaker 2" are identified separately.
-4. Embeddings are skipped below `MIN_EMBED_SPEECH_S` (default **0.3 s** of active speech); **1–2 s** per turn is still recommended for stable IDs.
+4. **1–2 s** per turn is still recommended so Nemotron has enough speech per window.
 
 ---
 
@@ -365,7 +320,7 @@ Worker logs on startup list resolved ONNX **input** and **output** tensor names 
 
 - Transcription uses 4-second overlapping windows, advancing every 3 seconds
   (`WINDOW_S` / `STEP_S`).
-- Speaker embedding extraction adds ~100–300 ms per speech segment.
+- Nemotron streaming adds CPU/GPU load per ~1 s diarization chunk (see model card RTF).
 - A larger ASR model or beam size can improve recognition at the cost of CPU
   speed and memory.
 
@@ -374,10 +329,9 @@ Worker logs on startup list resolved ONNX **input** and **output** tensor names 
 ## Known Limitations
 
 1. **Latency:** CPU inference is not real-time in the strict sense. Expect 3–6 second delays before transcription appears.
-2. **Speaker diarization accuracy:** The energy-based VAD + embedding approach works for clearly separated speakers. Overlapping speech is not handled.
-3. **Short utterances:** Segments with less than `MIN_EMBED_SPEECH_S` (~0.3 s default) of speech may not get an ECAPA embedding; labels then fall back to overlap/last-speaker heuristics.
-4. **First-speaker cold start:** The very first utterance is transcribed without a speaker label until the embedding is extracted.
-5. **Model download:** First run requires internet access and about 540 MB for the default ASR and diarization models.
+2. **Speaker diarization accuracy:** Nemotron handles overlap better than embedding-only heuristics, but CPU inference is slower than GPU.
+3. **Short utterances / latency:** Streaming buffer (~1 s minimum with `low_latency`) means very early words may lack a speaker label until the buffer fills.
+4. **Model download:** First run needs internet; ~460 MB ASR + ~400 MB Nemotron weights.
 6. **Browser compatibility:** Tested on Chrome and Firefox. Safari's AudioContext sample rate handling may vary.
 7. **Multilingual:** Uses `small.en` by default (English only). Use `MODEL_SIZE=small` and `LANGUAGE=auto` for multilingual speech.
 
@@ -399,11 +353,11 @@ Worker logs on startup list resolved ONNX **input** and **output** tensor names 
 
 ### "Diarization model unavailable"
 
-- Usually missing `onnxruntime`, a bad `ECAPA_ONNX_PATH`, or no network for the first Hugging Face download of `kenrunio/transcriber-speaker-onnx` / `ecapa-any-length.onnx`.
-- Transcription still works without diarization; speaker labels will be `null` unless `SINGLE_SPEAKER_MODE=true`.
-- Check worker logs for `ECAPA ONNX loaded. inputs=... outputs=...` or the error from `load_model()`.
-- Install `onnxruntime` and verify `ECAPA_ONNX_REPO_ID`, `ECAPA_ONNX_FILENAME`, or `ECAPA_ONNX_PATH` in `ai-worker/.env`.
-- To run ASR-only with a fixed label, set `SINGLE_SPEAKER_MODE=true`.
+- Install `torch`, `transformers>=4.57`, and `huggingface-hub>=0.34` in the worker venv.
+- Ensure network access for the first download of `nvidia/Nemotron-3-Diarization`.
+- Check worker logs for `Nemotron-3-Diarization ready` or `Diarization backend failed`.
+- On Windows, use `DIAR_BACKEND=transformers` (NeMo 3.0.x may fail to load this checkpoint).
+- ASR-only with a fixed label: `SINGLE_SPEAKER_MODE=true`.
 
 ### "No transcript appears"
 
